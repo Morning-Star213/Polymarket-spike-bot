@@ -42,10 +42,10 @@ def log(msg):
 load_dotenv(".env")
 
 WEB3_PROVIDER = "https://polygon-rpc.com"
-YOUR_PROXY_WALLET = Web3.to_checksum_address("0xAD25B950d4b2FE8e5cD67aAfF8Ea07dc32A7Ba7c")
-BOT_TRADER_ADDRESS = Web3.to_checksum_address("0x57e8701477723F013C4a890F00a27c9F4b83e8F6")
-USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-POLYMARKET_SETTLEMENT_CONTRACT = "0x56C79347e95530c01A2FC76E732f9566dA16E113"
+YOUR_PROXY_WALLET = Web3.to_checksum_address(os.getenv("YOUR_PROXY_WALLET"))
+BOT_TRADER_ADDRESS = Web3.to_checksum_address(os.getenv("BOT_TRADER_ADDRESS"))
+USDC_CONTRACT_ADDRESS = os.getenv("USDC_CONTRACT_ADDRESS")
+POLYMARKET_SETTLEMENT_CONTRACT = os.getenv("POLYMARKET_SETTLEMENT_CONTRACT")
 
 PRIVATE_KEY = os.getenv("PK")
 if not PRIVATE_KEY:
@@ -245,7 +245,7 @@ def place_order(side: str, asset: str, amount_in_shares: float, reason: str,
             # 💵 Enforce $10 cap on BUY orders
             if side.upper() == "BUY":
                 log("🛒 Processing BUY order...")
-                max_usd = 3.0
+                max_usd = os.getenv("buy_unit_size")
                 amount_in_shares = round(max_usd / current_price, 4)
                 usdc_needed = current_price * amount_in_shares
                 
