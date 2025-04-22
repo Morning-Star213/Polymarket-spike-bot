@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -20,10 +19,10 @@ var/
 .installed.cfg
 *.egg
 MANIFEST
-.env
 .venv
 venv/
 ENV/
+.env
 
 # Logs
 *.log
