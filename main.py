@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 
 # Global state variables
-price_history = {}  # {asset_id: deque[(timestamp, price)]}
+price_history = {}  # {asset_id: deque[(timestamp, price, eventslug, outcome)]}
 active_trades = {}  # {asset_id: {"entry_price": ..., "entry_time": ..., "shares": ..., "bot_triggered": True}}
 latest_active_trade = {}  # {asset_id: {"asset_pair": "asset_id:opposite", "asset_id": "...", "entry_time": "...", "trade_type": "buy/sell", "shares": ...}}
 last_trade_closed_at = 0
@@ -63,10 +63,10 @@ client = ClobClient(
 api_creds = client.create_or_derive_api_creds()
 client.set_api_creds(api_creds)
 
-def get_price_history(asset_id: str) -> List[Tuple[datetime, float]]:
+def get_price_history(asset_id: str) -> List[Tuple[datetime, float, str, str]]:
     return list(price_history.get(asset_id, deque()))
 
-def add_price(asset_id: str, timestamp: datetime, price: float):
+def add_price(asset_id: str, timestamp: datetime, price: float, eventslug: str, outcome: str):
     if asset_id not in price_history:
         price_history[asset_id] = deque(maxlen=max_price_history_size)
     
@@ -77,7 +77,7 @@ def add_price(asset_id: str, timestamp: datetime, price: float):
         if len(price_history[asset_id]) == 0:  # Prevent infinite loop if deque is empty
             break
     
-    price_history[asset_id].append((timestamp, price))
+    price_history[asset_id].append((timestamp, price, eventslug, outcome))
 
 def get_active_trades() -> Dict[str, dict]:
     return dict(active_trades)
@@ -124,6 +124,8 @@ def fetch_positions():
             return {}
         positions = {}
         for pos in data:
+            eventslug = pos.get("eventSlug")
+            outcome = pos.get("outcome")
             asset = pos.get("asset")
             avg_price = pos.get("avgPrice")
             shares = pos.get("size")
@@ -133,6 +135,8 @@ def fetch_positions():
                 if event_id not in positions:
                     positions[event_id] = []
                 positions[event_id].append({
+                    "eventslug": eventslug,
+                    "outcome": outcome,
                     "asset": asset,
                     "avg_price": avg_price,
                     "shares": shares,
@@ -454,17 +458,21 @@ def detect_and_trade():
 
         old_price = history[0][1]
         new_price = history[-1][1]
+        eventslug = history[0][2]
+        outcome = history[0][3]
         delta = (new_price - old_price) / old_price
 
-        log(f"📈 {asset_id}: old={old_price:.4f}, new={new_price:.4f}, delta={delta:.2%}")
+        log(f"📈 {outcome} share in {eventslug}: old={old_price:.4f}, new={new_price:.4f}, delta={delta:.2%}")
 
-        if old_price < 0.20:
+        # Avoid riding a massively unprofitable entry
+        if old_price < 0.20 and abs(delta) < 0.01 and old_price > 0.90:
             continue
 
         if abs(delta) >= 0.01:
-            log(f"🟨 Spike detected on {asset_id} with delta {delta:.2%}")
+            log(f"🟨 Spike detected on {outcome} share in {eventslug} with delta {delta:.2%}")
             opposite = get_asset_pair(asset_id)
-            log(f"🔄 Opposite asset: {opposite}")
+            opposite_position = fetch_positions(opposite)
+            log(f"🔄 Opposite asset: ")
             
             if not opposite:
                 log(f"❌ No opposite found for {asset_id}")
@@ -473,31 +481,30 @@ def detect_and_trade():
             handle_spike_trade(asset_id, opposite, delta, new_price)
 
 def update_price_history():
-    """Updates price history with thread-safe state management."""
+
     now = datetime.now(UTC)
     positions = fetch_positions()
     
     for event_id, assets in positions.items():
-        for outcome in assets:
-            asset_id = outcome["asset"]
-            price = outcome["current_price"]
-            add_price(asset_id, now, price)
-            log(f"💾 Updated price for {asset_id}: {price:.4f}")
+        for asset in assets:
+            eventslug = asset["eventslug"]
+            outcome = asset["outcome"]
+            asset_id = asset["asset"]
+            price = asset["current_price"]
+            add_price(asset_id,now, price, eventslug, outcome)
+            log(f"💾 Updated price for {outcome} share in {eventslug}: {price:.4f}")
 
 def get_current_price(asset_id: str) -> Optional[float]:
-    """Gets the current price with proper error handling."""
     try:
-        # First try to get from price history
         history = get_price_history(asset_id)
         if history:
             return history[-1][1]
             
-        # Fallback to live price
-        positions = fetch_positions()
-        for sides in positions.values():
-            for side in sides:
-                if side["asset"] == asset_id:
-                    return side["current_price"]
+        # positions = fetch_positions()
+        # for sides in positions.values():
+        #     for side in sides:
+        #         if side["asset"] == asset_id:
+        #             return side["current_price"]
     except Exception as e:
         log(f"⚠️ Live price fetch failed for {asset_id}: {e}")
     return None
