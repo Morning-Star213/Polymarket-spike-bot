@@ -2,6 +2,11 @@ import json
 import os
 import time
 import requests
+import threading
+import json
+import logging
+import colorlog
+from halo import Halo
 from datetime import datetime, timedelta, UTC
 from dotenv import load_dotenv
 from web3 import Web3
@@ -13,31 +18,59 @@ from typing import Dict, List, Tuple, Optional
 from collections import deque
 
 # Setup logging
-logging.basicConfig(
-    filename='bot_log.txt',
-    filemode='a',  # 'w' to overwrite every run
-    format='%(asctime)s - %(message)s',
-    level=logging.INFO
-)
+
+file_handler = logging.FileHandler('polymarket_spike_bot.log', mode='a', encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Create a custom StreamHandler that uses UTF-8 encoding
+class UTF8StreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            if not isinstance(msg, str):
+                msg = str(msg)
+            stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+console_handler = UTF8StreamHandler()
+console_handler.setFormatter(colorlog.ColoredFormatter(
+    "%(log_color)s%(message)s%(reset)s",
+    log_colors={
+        'DEBUG': 'cyan',
+        'INFO': 'green',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
+        'CRITICAL': 'red,bg_white'
+    }
+))
+
+logger = colorlog.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+
+# Add locks for thread-safe access to shared data
+price_history_lock = threading.Lock()
+active_trades_lock = threading.Lock()
+positions_lock = threading.Lock()
 
 # Global state variables
-price_history = {}  # {asset_id: deque[(timestamp, price, eventslug, outcome)]}
-active_trades = {}  # {asset_id: {"entry_price": ..., "entry_time": ..., "shares": ..., "bot_triggered": True}}
-latest_active_trade = {}  # {asset_id: {"asset_pair": "asset_id:opposite", "asset_id": "...", "entry_time": "...", "trade_type": "buy/sell", "shares": ...}}
+price_history = {}  # {(asset_id): deque[(timestamp, price, eventslug, outcome)]}
+active_trades = {} 
+latest_active_trade = {}  
 last_trade_closed_at = 0
 last_spike_asset = None
 last_spike_price = None
 initialized_assets = set()
 asset_pairs = {}  # asset_id -> opposite_id
 recent_trades = {}  # asset_id -> timestamp of last spike trade
-max_price_history_age = 120  # seconds
-max_price_history_size = 1000  # entries per asset
+max_price_history_size = 120  # entries per asset
 TRADE_UNIT = 3.0  # Amount in USD for each trade
 MIN_TRADE_INTERVAL = 60  # Minimum seconds between trades for the same pair
-
-def log(msg):
-    print(msg)
-    logging.info(msg)
 
 load_dotenv(".env")
 
@@ -66,18 +99,13 @@ client.set_api_creds(api_creds)
 def get_price_history(asset_id: str) -> List[Tuple[datetime, float, str, str]]:
     return list(price_history.get(asset_id, deque()))
 
+# Add price to price history
 def add_price(asset_id: str, timestamp: datetime, price: float, eventslug: str, outcome: str):
-    if asset_id not in price_history:
-        price_history[asset_id] = deque(maxlen=max_price_history_size)
-    
-    # Remove old entries more efficiently
-    while (price_history[asset_id] and 
-           (timestamp - price_history[asset_id][0][0]).total_seconds() > max_price_history_age):
-        price_history[asset_id].popleft()
-        if len(price_history[asset_id]) == 0:  # Prevent infinite loop if deque is empty
-            break
-    
-    price_history[asset_id].append((timestamp, price, eventslug, outcome))
+    with price_history_lock:
+        if asset_id not in price_history:
+            price_history[asset_id] = deque(maxlen=max_price_history_size)
+        price_history[asset_id].append((timestamp, price, eventslug, outcome))
+
 
 def get_active_trades() -> Dict[str, dict]:
     return dict(active_trades)
@@ -98,6 +126,7 @@ def set_last_trade_time(timestamp: float):
 def get_asset_pair(asset_id: str) -> Optional[str]:
     return asset_pairs.get(asset_id)
 
+# Add asset pair
 def add_asset_pair(asset1: str, asset2: str):
     global initialized_assets
     asset_pairs[asset1] = asset2
@@ -129,8 +158,13 @@ def fetch_positions():
             asset = pos.get("asset")
             avg_price = pos.get("avgPrice")
             shares = pos.get("size")
+            initial_value = pos.get("initialValue")
+            current_value = pos.get("currentValue")
+            cashpnl = pos.get("cashPnl")
+            percent_pnl = pos.get("percentPnl")
+            realized_pnl = pos.get("realizedPnl")
             current_price = pos.get("curPrice")
-            event_id = pos.get("conditionId") or pos.get("eventId") or pos.get("marketId") or pos.get("asset")
+            event_id = pos.get("conditionId") or pos.get("eventId") or pos.get("marketId")
             if asset and avg_price is not None and shares and current_price is not None and event_id:
                 if event_id not in positions:
                     positions[event_id] = []
@@ -140,12 +174,17 @@ def fetch_positions():
                     "asset": asset,
                     "avg_price": avg_price,
                     "shares": shares,
-                    "current_price": current_price
+                    "current_price": current_price,
+                    "initial_value": initial_value,
+                    "current_value": current_value,
+                    "pnl": cashpnl,
+                    "percent_pnl": percent_pnl,
+                    "realized_pnl": realized_pnl
                 })
-        log(f"💰 Fetched positions: {positions}")
+        logger.info(f"💰 Fetched positions: {json.dumps(positions, indent=2)}")
         return positions
     except Exception as e:
-        log(f"⚠️ Failed to fetch positions: {e}")
+        logger.error(f"⚠️ Failed to fetch positions: {e}")
         return {}
 
 def get_actual_balance(asset_id):
@@ -180,7 +219,7 @@ def ensure_usdc_allowance(required_amount: float) -> bool:
             if current_allowance >= required_amount_with_buffer:
                 return True
 
-            log(f"🔄 Approving USDC allowance... (attempt {attempt + 1}/{max_retries})")
+            logger.info(f"🔄 Approving USDC allowance... (attempt {attempt + 1}/{max_retries})")
             
             # Calculate new allowance: max of current and required
             new_allowance = max(current_allowance, required_amount_with_buffer)
@@ -198,17 +237,17 @@ def ensure_usdc_allowance(required_amount: float) -> bool:
             receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
             
             if receipt.status == 1:
-                log(f"✅ USDC allowance updated: {tx_hash.hex()}")
+                logger.info(f"✅ USDC allowance updated: {tx_hash.hex()}")
                 return True
             else:
-                log(f"❌ USDC allowance update failed: {tx_hash.hex()}")
+                logger.error(f"❌ USDC allowance update failed: {tx_hash.hex()}")
                 
         except Exception as e:
-            log(f"⚠️ Error in USDC allowance update (attempt {attempt + 1}): {e}")
+            logger.error(f"⚠️ Error in USDC allowance update (attempt {attempt + 1}): {e}")
             
         if attempt < max_retries - 1:
             delay = base_delay * (2 ** attempt)  # exponential backoff
-            log(f"⏳ Waiting {delay}s before retry...")
+            logger.info(f"⏳ Waiting {delay}s before retry...")
             time.sleep(delay)
     
     return False
@@ -219,36 +258,36 @@ def refresh_api_credetials() -> bool:
         global client, api_creds
         api_creds = client.create_or_derive_api_creds()
         client.set_api_creds(api_creds)
-        log("✅ API credentials refreshed successfully")
+        logger.info("✅ API credentials refreshed successfully")
         return True
     except Exception as e:
-        log(f"❌ Failed to refresh API credentials: {str(e)}")
+        logger.error(f"❌ Failed to refresh API credentials: {str(e)}")
         return False
 
 def place_order(side: str, asset: str, amount_in_shares: float, reason: str, 
                 fallback_to_sell: bool = False, fallback_to_buy: bool = False) -> bool:
     if not asset:
-        log(f"⚠️ Invalid asset. Skipping order for {asset}")
+        logger.warning(f"⚠️ Invalid asset. Skipping order for {asset}")
         return False
     
-    log(f"🔍 Order parameters - Side: {side}, Asset: {asset}, Amount: {amount_in_shares}, Reason: {reason}")
-    log(f"🔄 Fallback settings - fallback_to_sell: {fallback_to_sell}, fallback_to_buy: {fallback_to_buy}")
+    logger.info(f"🔍 Order parameters - Side: {side}, Asset: {asset}, Amount: {amount_in_shares}, Reason: {reason}")
+    logger.info(f"🔄 Fallback settings - fallback_to_sell: {fallback_to_sell}, fallback_to_buy: {fallback_to_buy}")
     
     max_retries = 3
     base_delay = 1  # seconds
     
     for attempt in range(max_retries):
-        log(f"🔄 Order attempt {attempt + 1}/{max_retries} for {side} {asset}")
+        logger.info(f"🔄 Order attempt {attempt + 1}/{max_retries} for {side} {asset}")
         try:
             current_price = get_current_price(asset)
-            log(f"💰 Current price for {asset}: {current_price}")
+            logger.info(f"💰 Current price for {asset}: {current_price}")
             if not current_price:
-                log(f"⚠️ Could not fetch price for {asset}. Skipping order.")
+                logger.warning(f"⚠️ Could not fetch price for {asset}. Skipping order.")
                 return False
 
             # 💵 Enforce $10 cap on BUY orders
             if side.upper() == "BUY":
-                log("🛒 Processing BUY order...")
+                logger.info("🛒 Processing BUY order...")
                 max_usd = os.getenv("buy_unit_size")
                 amount_in_shares = round(max_usd / current_price, 4)
                 usdc_needed = current_price * amount_in_shares
@@ -262,27 +301,27 @@ def place_order(side: str, asset: str, amount_in_shares: float, reason: str,
                     ])
                     usdc_balance = usdc_contract.functions.balanceOf(YOUR_PROXY_WALLET).call() / 10**6
                     
-                    log(f"💵 USDC Balance: ${usdc_balance:.2f}, Required: ${usdc_needed:.2f}")
+                    logger.info(f"💵 USDC Balance: ${usdc_balance:.2f}, Required: ${usdc_needed:.2f}")
                     
                     if usdc_balance < usdc_needed:
-                        log(f"❌ Insufficient USDC balance. Required: ${usdc_needed:.2f}, Available: ${usdc_balance:.2f}")
+                        logger.warning(f"❌ Insufficient USDC balance. Required: ${usdc_needed:.2f}, Available: ${usdc_balance:.2f}")
                         return False
                         
                     if not ensure_usdc_allowance(usdc_needed):
-                        log(f"❌ Failed to ensure USDC allowance for {asset}")
+                        logger.error(f"❌ Failed to ensure USDC allowance for {asset}")
                         return False
                 except Exception as e:
-                    log(f"❌ Failed to check USDC balance: {str(e)}")
+                    logger.error(f"❌ Failed to check USDC balance: {str(e)}")
                     return False
             else:
                 actual_shares = get_actual_balance(asset)
                 current_price = get_current_price(asset)
                 amount_in_shares = actual_shares - round(1.0 / current_price, 4)
             if amount_in_shares <= 0:
-                log(f"⚠️ Invalid share amount. Skipping SELL order for {asset}")
+                logger.warning(f"⚠️ Invalid share amount. Skipping SELL order for {asset}")
                 return False
             side_formatted = BUY if side.upper() == "BUY" else SELL
-            log(f"📤 Preparing {side.upper()} order: {amount_in_shares:.4f} shares of {asset} ({reason})")
+            logger.info(f"📤 Preparing {side.upper()} order: {amount_in_shares:.4f} shares of {asset} ({reason})")
 
             order_args = MarketOrderArgs(
                 token_id=str(asset),
@@ -290,35 +329,35 @@ def place_order(side: str, asset: str, amount_in_shares: float, reason: str,
                 side=side_formatted,
             )
 
-            log(f"🔑 Creating signed order for {asset}...")
+            logger.info(f"🔑 Creating signed order for {asset}...")
             signed_order = client.create_market_order(order_args)
             
             # Log order details without JSON serialization
-            log(f"📝 Order details: {str(signed_order)}")
+            logger.info(f"📝 Order details: {str(signed_order)}")
             
             order_type = OrderType.FOK if (fallback_to_sell or fallback_to_buy) else OrderType.FOK
-            log(f"📨 Posting order with type: {order_type}")
+            logger.info(f"📨 Posting order with type: {order_type}")
             
             response = client.post_order(signed_order, order_type)
             # Log response without JSON serialization
-            log(f"📥 Order response: {str(response)}")
+            logger.info(f"📥 Order response: {str(response)}")
 
             if response.get("success"):
                 filled = response.get("data", {}).get("filledAmount", amount_in_shares)
-                log(f"✅ [{reason}] Order placed: {side.upper()} {filled:.4f} shares of {asset}")
+                logger.info(f"✅ [{reason}] Order placed: {side.upper()} {filled:.4f} shares of {asset}")
                 update_recent_trade(asset)
                 return True
             else:
                 error_msg = response.get('errorMsg', 'Unknown error')
                 error_code = response.get('errorCode', 'No error code')
-                log(f"❌ [{reason}] Order failed with code {error_code}: {error_msg}")
-                log(f"❌ Full error response: {json.dumps(response, indent=2)}")
+                logger.error(f"❌ [{reason}] Order failed with code {error_code}: {error_msg}")
+                logger.error(f"❌ Full error response: {json.dumps(response, indent=2)}")
                 
                 # Handle SELL fallback without recursion
                 if side.upper() == "SELL" and fallback_to_sell and not reason.endswith("_fallback"):
-                    log(f"⚠️ SELL failed — attempting fallback with actual balance...")
+                    logger.warning(f"⚠️ SELL failed — attempting fallback with actual balance...")
                     actual_shares = get_actual_balance(asset)
-                    log(f"📊 Actual balance for {asset}: {actual_shares}")
+                    logger.info(f"📊 Actual balance for {asset}: {actual_shares}")
                     
                     if actual_shares and actual_shares > 0.001:
                         # Create new order args with actual shares
@@ -327,32 +366,32 @@ def place_order(side: str, asset: str, amount_in_shares: float, reason: str,
                             amount=float(actual_shares),
                             side=SELL,
                         )
-                        log(f"🔄 Retrying with actual shares: {actual_shares}")
+                        logger.info(f"🔄 Retrying with actual shares: {actual_shares}")
                         signed_order = client.create_market_order(order_args)
                         response = client.post_order(signed_order, OrderType.FOK)
                         
-                        log(f"📥 Fallback order response: {json.dumps(response, indent=2)}")
+                        logger.info(f"📥 Fallback order response: {json.dumps(response, indent=2)}")
                         
                         if response.get("success"):
                             filled = response.get("data", {}).get("filledAmount", actual_shares)
-                            log(f"✅ [{reason}_fallback] Order placed: SELL {filled:.4f} shares of {asset}")
+                            logger.info(f"✅ [{reason}_fallback] Order placed: SELL {filled:.4f} shares of {asset}")
                             update_recent_trade(asset)
                             return True
                         else:
                             error_msg = response.get('errorMsg', 'Unknown error')
                             error_code = response.get('errorCode', 'No error code')
-                            log(f"❌ [{reason}_fallback] Order failed with code {error_code}: {error_msg}")
-                            log(f"❌ Full fallback error response: {json.dumps(response, indent=2)}")
+                            logger.error(f"❌ [{reason}_fallback] Order failed with code {error_code}: {error_msg}")
+                            logger.error(f"❌ Full fallback error response: {json.dumps(response, indent=2)}")
                 
         except Exception as e:
-            log(f"⚠️ Error during {side.upper()} order for {asset}: {str(e)}")
-            log(f"⚠️ Error type: {type(e).__name__}")
+            logger.error(f"⚠️ Error during {side.upper()} order for {asset}: {str(e)}")
+            logger.error(f"⚠️ Error type: {type(e).__name__}")
             import traceback
-            log(f"⚠️ Stack trace: {traceback.format_exc()}")
+            logger.error(f"⚠️ Stack trace: {traceback.format_exc()}")
         
         if attempt < max_retries - 1:
             delay = base_delay * (2 ** attempt)  # exponential backoff
-            log(f"⏳ Waiting {delay}s before retry...")
+            logger.info(f"⏳ Waiting {delay}s before retry...")
             time.sleep(delay)
     
     return False
@@ -385,7 +424,7 @@ def update_latest_trade(asset_id: str, opposite: str, trade_type: str, shares: f
 def handle_spike_trade(asset_id: str, opposite: str, delta: float, current_price: float):
     """Handle trading logic for a detected spike"""
     if not can_trade_asset(asset_id):
-        log(f"⏳ Trade cooldown active for {asset_id}")
+        logger.info(f"⏳ Trade cooldown active for {asset_id}")
         return
 
     if delta < 0:  # Price decreased
@@ -395,14 +434,14 @@ def handle_spike_trade(asset_id: str, opposite: str, delta: float, current_price
         sell_shares = shares - keep_shares
         
         if sell_shares > 0.001:
-            log(f"💰 SELLing {sell_shares:.4f} shares of {asset_id}")
+            logger.info(f"💰 SELLing {sell_shares:.4f} shares of {asset_id}")
             success = place_order("SELL", asset_id, sell_shares, "spike_decrease", fallback_to_sell=True)
             if success:
                 update_latest_trade(asset_id, opposite, "sell", sell_shares)
 
         # Buy opposite asset
         buy_shares = round(TRADE_UNIT / current_price, 4)
-        log(f"💰 BUYing {buy_shares:.4f} shares of {opposite}")
+        logger.info(f"💰 BUYing {buy_shares:.4f} shares of {opposite}")
         success = place_order("BUY", opposite, buy_shares, "spike_decrease", fallback_to_buy=True)
         if success:
             update_latest_trade(opposite, asset_id, "buy", buy_shares)
@@ -416,7 +455,7 @@ def handle_spike_trade(asset_id: str, opposite: str, delta: float, current_price
     elif delta > 0:  # Price increased
         # Buy spike asset
         buy_shares = round(TRADE_UNIT / current_price, 4)
-        log(f"💰 BUYing {buy_shares:.4f} shares of {asset_id}")
+        logger.info(f"💰 BUYing {buy_shares:.4f} shares of {asset_id}")
         success = place_order("BUY", asset_id, buy_shares, "spike_increase", fallback_to_buy=True)
         if success:
             update_latest_trade(asset_id, opposite, "buy", buy_shares)
@@ -433,13 +472,13 @@ def handle_spike_trade(asset_id: str, opposite: str, delta: float, current_price
         sell_shares = shares - keep_shares
         
         if sell_shares > 0.001:
-            log(f"💰 SELLing {sell_shares:.4f} shares of {opposite}")
+            logger.info(f"💰 SELLing {sell_shares:.4f} shares of {opposite}")
             success = place_order("SELL", opposite, sell_shares, "spike_increase", fallback_to_sell=True)
             if success:
                 update_latest_trade(opposite, asset_id, "sell", sell_shares)
 
 def detect_and_trade():
-    log("🔍 Scanning for spikes...")
+    logger.info("🔍 Scanning for spikes...")
     now = datetime.now(UTC)
 
     # Get all assets from price history
@@ -449,7 +488,7 @@ def detect_and_trade():
 
     for asset_id in all_assets:
         if is_recently_traded(asset_id):
-            log(f"🕒 Recently traded {asset_id} — skipping.")
+            logger.info(f"🕒 Recently traded {asset_id} — skipping.")
             continue
 
         history = get_price_history(asset_id)
@@ -462,39 +501,46 @@ def detect_and_trade():
         outcome = history[0][3]
         delta = (new_price - old_price) / old_price
 
-        log(f"📈 {outcome} share in {eventslug}: old={old_price:.4f}, new={new_price:.4f}, delta={delta:.2%}")
+        logger.info(f"📈 {outcome} share in {eventslug}: old={old_price:.4f}, new={new_price:.4f}, delta={delta:.2%}")
 
         # Avoid riding a massively unprofitable entry
         if old_price < 0.20 and abs(delta) < 0.01 and old_price > 0.90:
             continue
 
         if abs(delta) >= 0.01:
-            log(f"🟨 Spike detected on {outcome} share in {eventslug} with delta {delta:.2%}")
+            logger.info(f"🟨 Spike detected on {outcome} share in {eventslug} with delta {delta:.2%}")
             opposite = get_asset_pair(asset_id)
             opposite_position = fetch_positions(opposite)
-            log(f"🔄 Opposite asset: ")
+            logger.info(f"🔄 Opposite asset: ")
             
             if not opposite:
-                log(f"❌ No opposite found for {asset_id}")
+                logger.warning(f"❌ No opposite found for {asset_id}")
                 continue
 
             handle_spike_trade(asset_id, opposite, delta, new_price)
 
+# Update price history every 1 second
 def update_price_history():
-
-    now = datetime.now(UTC)
-    positions = fetch_positions()
-    
-    for event_id, assets in positions.items():
-        for asset in assets:
-            eventslug = asset["eventslug"]
-            outcome = asset["outcome"]
-            asset_id = asset["asset"]
-            price = asset["current_price"]
-            add_price(asset_id,now, price, eventslug, outcome)
-            log(f"💾 Updated price for {outcome} share in {eventslug}: {price:.4f}")
+    try:
+        while True:
+            now = datetime.now(UTC)
+            positions = fetch_positions()
+        
+            for event_id, assets in positions.items():
+                for asset in assets:
+                    with price_history_lock:
+                        eventslug = asset["eventslug"]
+                        outcome = asset["outcome"]
+                        asset_id = asset["asset"]
+                        price = asset["current_price"]
+                        add_price(asset_id, now, price, eventslug, outcome)
+                    logger.info(f"💾 Updated price of {outcome} share in {eventslug}: {asset_id}:{price:.4f}")
+            time.sleep(1)
+    except Exception as e:
+        logger.error(f"❌ Error updating price history: {e}")
 
 def get_current_price(asset_id: str) -> Optional[float]:
+
     try:
         history = get_price_history(asset_id)
         if history:
@@ -506,14 +552,14 @@ def get_current_price(asset_id: str) -> Optional[float]:
         #         if side["asset"] == asset_id:
         #             return side["current_price"]
     except Exception as e:
-        log(f"⚠️ Live price fetch failed for {asset_id}: {e}")
+        logger.warning(f"⚠️ Live price fetch failed for {asset_id}: {e}")
     return None
 
 def check_trade_exits():
     """Checks and handles trade exits with proper state management."""
     now = datetime.now(UTC)
     active_trades = get_active_trades()
-    log(f"📈 Active trades: {len(active_trades)}")
+    logger.info(f"📈 Active trades: {len(active_trades)}")
 
     for asset_id in list(active_trades.keys()):
         trade = active_trades[asset_id]
@@ -540,22 +586,22 @@ def check_trade_exits():
             retry_count = trade.get("retry_count", 0)
             
             if retry_count >= max_retries:
-                log(f"❌ Max retries reached for {asset_id}, removing from active trades")
+                logger.error(f"❌ Max retries reached for {asset_id}, removing from active trades")
                 remove_active_trade(asset_id)
                 continue
                 
             if time.time() - trade.get("pending_exit_since", 0) < cooldown:
-                log(f"⏳ Waiting before retrying SELL for {asset_id}")
+                logger.info(f"⏳ Waiting before retrying SELL for {asset_id}")
                 continue
             else:
-                log(f"🔁 Retrying SELL for {asset_id} after cooldown (attempt {retry_count + 1}/{max_retries})")
+                logger.info(f"🔁 Retrying SELL for {asset_id} after cooldown (attempt {retry_count + 1}/{max_retries})")
                 trade["retry_count"] = retry_count + 1
                 add_active_trade(asset_id, trade)
 
-        log(f"🕒 {asset_id} held for {int(time_held.total_seconds() // 60)}m {int(time_held.total_seconds() % 60)}s")
-        log(f"💰 PNL Check: entry={entry_price:.4f}, current={current_price:.4f}, profit={profit:.2%}")
-        log(f"⏱ Checking exit logic for {asset_id} | Held: {time_held.total_seconds():.2f}s | Profit: {profit:.2%}")
-        log(f"⏱ Entry Time: {entry_time}, Now: {now}, Held Seconds: {time_held.total_seconds():.2f}")
+        logger.info(f"🕒 {asset_id} held for {int(time_held.total_seconds() // 60)}m {int(time_held.total_seconds() % 60)}s")
+        logger.info(f"💰 PNL Check: entry={entry_price:.4f}, current={current_price:.4f}, profit={profit:.2%}")
+        logger.info(f"⏱ Checking exit logic for {asset_id} | Held: {time_held.total_seconds():.2f}s | Profit: {profit:.2%}")
+        logger.info(f"⏱ Entry Time: {entry_time}, Now: {now}, Held Seconds: {time_held.total_seconds():.2f}")
 
         def handle_failed_sell(reason: str, asset_id: str):
             positions = fetch_positions()
@@ -569,47 +615,48 @@ def check_trade_exits():
                     break
 
             if asset_still_held:
-                log(f"⚠️ SELL failed for {reason} — position still active, will retry later")
+                logger.warning(f"⚠️ SELL failed for {reason} — position still active, will retry later")
                 trade["pending_exit"] = True
                 trade["pending_exit_since"] = time.time()
                 add_active_trade(asset_id, trade)
             else:
-                log(f"✅ SELL likely succeeded (or dust) — clearing {asset_id}")
+                logger.info(f"✅ SELL likely succeeded (or dust) — clearing {asset_id}")
                 remove_active_trade(asset_id)
                 set_last_trade_time(time.time())
 
         if profit >= float(os.getenv("take_profit")):
-            log(f"🎯 TP hit for {asset_id}. Selling...")
+            logger.info(f"🎯 TP hit for {asset_id}. Selling...")
             success = place_order("SELL", asset_id, shares, "take_profit", fallback_to_sell=True)
             if success:
                 remove_active_trade(asset_id)
                 set_last_trade_time(time.time())
-                log("✅ Trade closed — ready for next.")
+                logger.info("✅ Trade closed — ready for next.")
             else:
                 handle_failed_sell("TP", asset_id)
 
         elif profit <= float(os.getenv("stop_loss")):
-            log(f"🛑 SL hit for {asset_id}. Selling...")
+            logger.warning(f"🛑 SL hit for {asset_id}. Selling...")
             success = place_order("SELL", asset_id, shares, "stop_loss", fallback_to_sell=True)
             if success:
                 remove_active_trade(asset_id)
                 set_last_trade_time(time.time())
-                log("✅ Trade closed — ready for next.")
+                logger.info("✅ Trade closed — ready for next.")
             else:
                 handle_failed_sell("SL", asset_id)
 
         elif time_held >= timedelta(minutes=1):
-            log(f"⌛ Time-based exit for {asset_id}. Selling...")
+            logger.info(f"⌛ Time-based exit for {asset_id}. Selling...")
             success = place_order("SELL", asset_id, shares, "timeout_exit", fallback_to_sell=True)
             if success:
                 remove_active_trade(asset_id)
                 set_last_trade_time(time.time())
-                log("✅ Trade closed — ready for next.")
+                logger.info("✅ Trade closed — ready for next.")
             else:
                 handle_failed_sell("timeout", asset_id)
 
+# Wait for manual $1 entries on both sides of a market
 def wait_for_initialization():
-    log("🕓 Waiting for manual $1 entries on both sides of a market...")
+    logger.info("🕓 Waiting for manual $1 entries on both sides of a market...")
     max_retries = 60  # 1 minute total with 2-second sleep
     retry_count = 0
     
@@ -617,38 +664,68 @@ def wait_for_initialization():
         try:
             positions = fetch_positions()
             for event_id, sides in positions.items():
-                log(f"🔎 Event ID {event_id}: {len(sides)}")
+                logger.info(f"🔎 Event ID {event_id}: {len(sides)}")
                 if len(sides) % 2 == 0 and len(sides) > 1:
                     ids = [s["asset"] for s in sides]
                     add_asset_pair(ids[0], ids[1])
-                    log(f"✅ Initialized asset pair: {ids[0]} ↔ {ids[1]}")
+                    logger.info(f"✅ Initialized asset pair: {ids[0]} ↔ {ids[1]}")
             
             if is_initialized():
-                log(f"✅ Initialization complete with {len(initialized_assets)} assets.")
+                logger.info(f"✅ Initialization complete with {len(initialized_assets)} assets.")
                 return True
                 
             retry_count += 1
             time.sleep(2)
             
         except Exception as e:
-            log(f"⚠️ Error during initialization: {e}")
+            logger.info(f"⚠️ Error during initialization: {e}")
             retry_count += 1
             time.sleep(2)
     
-    log("❌ Initialization timed out after 2 minutes.")
+    logger.warning("❌ Initialization timed out after 2 minutes.")
     return False
 
+# Print spikebot banner
+def print_spikebot_banner():
+    banner = r"""
+╔════════════════════════════════════════════════════════════════════╗
+║                                                                    ║
+║   ███████╗██████╗ ██╗██╗  ██╗███████╗██████╗  ██████╗ ████████╗    ║
+║   ██╔════╝██╔══██╗██║██║ ██╔╝██╔════╝██╔══██╗██╔═══██╗╚══██╔══╝    ║
+║   ███████╗██████╔╝██║█████╔╝ █████╗  ██████╔╝██║   ██║   ██║       ║
+║   ╚════██║██╔═══╝ ██║██╔═██╗ ██╔══╝  ██╔══██╗██║   ██║   ██║       ║
+║   ███████║██║     ██║██║  ██╗███████╗██████╔╝╚██████╔╝   ██║       ║
+║   ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝╚═════╝  ╚═════╝    ╚═╝       ║
+║                                                                    ║
+║                  🚀  P O L Y M A R K E T  B O T  🚀                ║
+║                                                                    ║
+╚════════════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
 if __name__ == "__main__":
-    log(f"🚀 Spike-detection bot started at {datetime.now(UTC)}")
+    print_spikebot_banner()
+    spinner = Halo(text="Initializing...", spinner="dots")
+    spinner.start()
+    time.sleep(5)
+    logger.info(f"🚀 Spike-detection bot started at {datetime.now(UTC)}")
     
     if not wait_for_initialization():
-        log("❌ Failed to initialize. Exiting.")
+        spinner.fail("❌ Failed to initialize. Exiting.")
         exit(1)
+    else:
+        spinner.succeed("Initialized successfully")
         
+    price_update_thread = threading.Thread(target=update_price_history, daemon=True)
+    detect_and_trade_thread = threading.Thread(target=detect_and_trade, daemon=True)
+    check_trade_exits_thread = threading.Thread(target=check_trade_exits, daemon=True)
+    
+    price_update_thread.start()
+    detect_and_trade_thread.start()
+    check_trade_exits_thread.start()
+
     last_refresh_time = time.time()
     refresh_interval = 3600
-    last_price_update = time.time()
-    price_update_interval = 1  # Update prices every 1 seconds
     
     while True:
         try:
@@ -658,21 +735,12 @@ if __name__ == "__main__":
                 if refresh_api_credetials():
                     last_refresh_time = current_time
                 else:
-                    log("⚠️ Failed to refresh API credentials. Will retry in 5 minutes.")
+                    logger.warning("⚠️ Failed to refresh API credentials. Will retry in 5 minutes.")
                     time.sleep(300)
                     continue
-
-            if current_time - last_price_update >= price_update_interval:
-                update_price_history()
-                last_price_update = current_time
-            
-            detect_and_trade()
-            check_trade_exits()
-            
-            sleep_time = max(0, price_update_interval - (time.time() - current_time))
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            
+        except KeyboardInterrupt:
+            logger.info("👋 Shutting down gracefully...")
+            break
         except Exception as e:
-            log(f"❌ Error in main loop: {e}")
-            time.sleep(5)
+            logger.error(f"❌ Error in main loop: {e}")
+            time.sleep(1)
