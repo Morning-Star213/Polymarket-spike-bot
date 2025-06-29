@@ -176,6 +176,3 @@ This bot is for educational purposes only. Trading cryptocurrencies and predicti
    - Trade detection
    - Position management
    - API credential refresh
-
-## Contact ME
-[Telegram](https://t.me/trust4120)
