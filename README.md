@@ -156,23 +156,3 @@ This bot is for educational purposes only. Trading cryptocurrencies and predicti
 
 [Your License Here]
 
-## Bot Structure
-
-![Bot Architecture Diagram](diagram.png)
-
-1. **State Management**
-   - Global variables for tracking trades and prices
-   - Price history management
-   - Active trade tracking
-
-2. **Trading Logic**
-   - Price spike detection
-   - Order placement with retries
-   - Take-profit and stop-loss management
-   - USDC allowance management
-
-3. **Main Loop**
-   - Price updates
-   - Trade detection
-   - Position management
-   - API credential refresh
